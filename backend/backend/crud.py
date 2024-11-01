@@ -1,157 +1,153 @@
-from sqlalchemy.orm import Session
+from datetime import datetime
+
+from fastapi.exceptions import HTTPException
+from sqlmodel import Session, select
 
 from . import models, schemas
 
 
-def get_user(db: Session, user_id: int):
-    return db.query(models.User).filter(models.User.id == user_id).first()
-
-
-def get_user_by_username(db: Session, username: str):
-    return db.query(models.User).filter(models.User.username == username).first()
-
-
-def get_users(db: Session, skip: int = 0, limit: int = 100):
-    return db.query(models.User).offset(skip).limit(limit).all()
-
-
-def create_user(db: Session, user: schemas.UserCreate):
-    fake_hashed_password = user.password + "notreallyhashed"
-    db_user = models.User(
-        username=user.username,
-        hashed_password=fake_hashed_password,
-        starting_balance=user.starting_balance,
+def login(username: str, password: str, db: Session):
+    statement = select(models.User).where(
+        models.User.username == username, models.User.password == password
     )
+    found_user = db.exec(statement).first()
+
+    if not found_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    accounts = get_accounts_for_user(found_user.id or 0, db)
+
+    if not accounts:
+        raise HTTPException(status_code=422, detail="User has no accounts")
+
+    return schemas.UserLoginResponse(
+        user=schemas.User(**found_user.__dict__),
+        accounts=[schemas.Account(**account.__dict__) for account in accounts],
+    )
+
+
+def create_user(user: schemas.UserCreate, db: Session):
+    statement = select(models.User).where(models.User.username == user.username)
+    found_user = db.exec(statement).first()
+
+    if found_user:
+        raise HTTPException(status_code=422, detail="Username already exists")
+
+    db_user = models.User(username=user.username, password=user.password)
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
-    return db_user
 
+    user_response = schemas.User(**db_user.__dict__)
 
-def get_transactions_for_user(db: Session, user: schemas.User):
-    return (
-        db.query(models.Transaction).filter(models.Transaction.sender == user.id).all()
-        + db.query(models.Transaction)
-        .filter(models.Transaction.reciever == user.id)
-        .all()
+    db_account = models.Account(
+        name=user.first_account_name,
+        balance=user.starting_balance,
+        is_primary=True,
+        user_id=db_user.id,
     )
 
-
-def get_deposits_for_user(db: Session, user: schemas.User):
-    return (
-        db.query(models.Transaction)
-        .filter(models.Transaction.reciever == user.id)
-        .all()
-    )
-
-
-def get_withdrawals_for_user(db: Session, user: schemas.User):
-    return (
-        db.query(models.Transaction).filter(models.Transaction.sender == user.id).all()
-    )
-
-
-def get_pending_transactions_for_user(db: Session, user: schemas.User):
-    return (
-        db.query(models.Transaction)
-        .filter(models.Transaction.sender == user.id)
-        .filter(models.Transaction.reciever == None)
-        .all()
-        + db.query(models.Transaction)
-        .filter(models.Transaction.reciever == user.id)
-        .filter(models.Transaction.sender == None)
-        .all()
-    )
-
-
-def get_completed_transactions_for_user(db: Session, user: schemas.User):
-    return (
-        db.query(models.Transaction)
-        .filter(models.Transaction.sender == user.id)
-        .filter(models.Transaction.reciever != None)
-        .all()
-        + db.query(models.Transaction)
-        .filter(models.Transaction.reciever == user.id)
-        .filter(models.Transaction.sender != None)
-        .all()
-    )
-
-
-def get_deposits_and_withdrawals_for_user(db: Session, user: schemas.User):
-    return (
-        db.query(models.Transaction)
-        .filter(models.Transaction.sender == user.id)
-        .filter(models.Transaction.reciever == None)
-        .all()
-        + db.query(models.Transaction)
-        .filter(models.Transaction.reciever == user.id)
-        .filter(models.Transaction.sender == None)
-        .all()
-    )
-
-
-def create_deposit(
-    db: Session, user: schemas.User, transaction: schemas.TransactionBase
-):
-    db_transaction = models.Transaction(
-        amount=transaction.amount,
-        sender=None,
-        reciever=user.id,
-        note=transaction.note,
-    )
-    db.add(db_transaction)
+    db.add(db_account)
     db.commit()
-    db.refresh(db_transaction)
-    return db_transaction
+    db.refresh(db_account)
 
-
-def create_withdrawal(
-    db: Session, user: schemas.User, transaction: schemas.TransactionBase
-):
-    db_transaction = models.Transaction(
-        amount=transaction.amount,
-        sender=user.id,
-        reciever=None,
-        note=transaction.note,
+    return schemas.UserLoginResponse(
+        user=user_response,
+        accounts=[schemas.Account(**db_account.__dict__)],
     )
-    db.add(db_transaction)
-    db.commit()
-    db.refresh(db_transaction)
-    return db_transaction
 
 
-def create_request(db: Session, transaction: schemas.TransactionBase):
-    db_request = models.Transaction(
-        amount=transaction.amount,
-        sender=transaction.sender,
-        reciever=transaction.receiver,
-        note=transaction.note,
+def get_user(user_id: int, db: Session):
+    return db.get(models.User, user_id)
+
+
+def get_users(db: Session):
+    statement = select(models.User)
+
+    return db.exec(statement).all()
+
+
+def get_accounts_for_user(user_id: int, db: Session):
+    statement = select(models.Account).where(models.Account.user_id == user_id)
+
+    return db.exec(statement).all()
+
+
+def create_account(user_id: int, account: schemas.AccountBase, db: Session):
+    db_account = models.Account(
+        name=account.name, balance=account.balance, user_id=user_id
     )
-    db.add(db_request)
+
+    db.add(db_account)
+
     db.commit()
-    db.refresh(db_request)
-    return db_request
+    db.refresh(db_account)
+
+    return db_account
 
 
-def create_payment(
+def create_transaction(
+    sender_id: int,
+    receiver_id: int,
+    creator: int,
+    amount: int,
+    between_user_accounts,
     db: Session,
-    transaction: schemas.Transaction,
 ):
-    db_payment = models.Transaction(
-        amount=transaction.amount,
-        sender=transaction.sender,
-        reciever=transaction.receiver,
-        note=transaction.note,
+    current_time = datetime.now()
+    approved = between_user_accounts or False
+
+    db_transaction = models.Transaction(
+        sender=sender_id,
+        receiver=receiver_id,
+        created_by=creator,
+        amount=amount,
+        created_at=current_time,
+        approved=approved,
     )
-    db.add(db_payment)
+
+    db.add(db_transaction)
+
     db.commit()
-    db.refresh(db_payment)
-    return db_payment
+    db.refresh(db_transaction)
+
+    return db_transaction
 
 
-def get_transaction(db: Session, transaction_id: int):
-    return (
-        db.query(models.Transaction)
-        .filter(models.Transaction.id == transaction_id)
-        .first()
+def get_transaction(transaction_id: int, db: Session):
+    return db.get(models.Transaction, transaction_id)
+
+
+def get_transactions_for_user(user_id: int, db: Session):
+    statement = (
+        select(models.Transaction)
+        .where(models.Transaction.sender == user_id)
+        .where(models.Transaction.receiver == user_id)
+        .where(models.Transaction.created_by == user_id)
     )
+    return db.exec(statement).all()
+
+
+def get_transactions_to_approve(user_id: int, db: Session):
+    statement = select(models.Transaction).where(
+        models.Transaction.receiver == user_id, models.Transaction.approved == False
+    )
+    return db.exec(statement).all()
+
+
+def approve_transaction(transaction_id: int, db: Session):
+    db_transaction = db.get(models.Transaction, transaction_id)
+
+    if not db_transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if db_transaction.approved:
+        raise HTTPException(status_code=422, detail="Transaction already approved")
+
+    db_transaction.approved = True
+    db_transaction.approved_on = datetime.now()
+
+    db.commit()
+    db.refresh(db_transaction)
+
+    return db_transaction
